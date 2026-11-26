@@ -53,27 +53,27 @@ export function Navbar() {
 
         {/* Desktop Nav */}
         <div className="hidden md:flex items-center gap-6">
-          <a
-            href="#how-it-works"
+          <Link
+            href="/#how-it-works"
             className="text-sm font-medium transition-colors hover:opacity-80"
             style={{ color: "var(--vl-text-secondary)" }}
           >
             How It Works
-          </a>
-          <a
-            href="#security"
+          </Link>
+          <Link
+            href="/#security"
             className="text-sm font-medium transition-colors hover:opacity-80"
             style={{ color: "var(--vl-text-secondary)" }}
           >
             Security
-          </a>
-          <a
-            href="#faq"
+          </Link>
+          <Link
+            href="/#faq"
             className="text-sm font-medium transition-colors hover:opacity-80"
             style={{ color: "var(--vl-text-secondary)" }}
           >
             Help
-          </a>
+          </Link>
 
           {/* Theme Toggle */}
           <button
@@ -173,30 +173,30 @@ export function Navbar() {
           >
             Receive Video
           </Link>
-          <a
-            href="#how-it-works"
+          <Link
+            href="/#how-it-works"
             className="text-sm font-medium"
             style={{ color: "var(--vl-text-secondary)" }}
             onClick={() => setMobileOpen(false)}
           >
             How It Works
-          </a>
-          <a
-            href="#security"
+          </Link>
+          <Link
+            href="/#security"
             className="text-sm font-medium"
             style={{ color: "var(--vl-text-secondary)" }}
             onClick={() => setMobileOpen(false)}
           >
             Security
-          </a>
-          <a
-            href="#faq"
+          </Link>
+          <Link
+            href="/#faq"
             className="text-sm font-medium"
             style={{ color: "var(--vl-text-secondary)" }}
             onClick={() => setMobileOpen(false)}
           >
             Help
-          </a>
+          </Link>
           <div className="flex items-center gap-3 pt-2">
             <button
               onClick={toggleTheme}

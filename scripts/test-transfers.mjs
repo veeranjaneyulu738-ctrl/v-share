@@ -1,5 +1,11 @@
 import crypto from "crypto";
 
+try {
+  if (typeof process.loadEnvFile === "function") {
+    process.loadEnvFile(".env.local");
+  }
+} catch {}
+
 const BASE_URL = "http://localhost:3000";
 
 function log(step, msg, ok = true) {
@@ -16,7 +22,7 @@ async function runTests() {
 
   try {
     // ----------------------------------------------------
-    // TEST 1: Standard Transfer Creation & Multipart Upload
+    // TEST 1: Standard Cloud Transfer Creation & Multipart Upload
     // ----------------------------------------------------
     console.log("--- TEST 1: Standard Transfer Flow ---");
     const testFileSize = 1024 * 1024 * 3; // 3 MB mock video
@@ -36,6 +42,8 @@ async function runTests() {
         allowOriginalDownload: true,
         senderMessage: "Here is your original 4K video!",
         downloadLimit: 5,
+        isP2P: false,
+        transferMode: "cloud",
       }),
     });
 
@@ -165,6 +173,8 @@ async function runTests() {
         contentType: "video/mp4",
         expirationHours: 1,
         password: "SecretVaultPassword!123",
+        isP2P: false,
+        transferMode: "cloud",
       }),
     });
     const passTransfer = await passTransferRes.json();
@@ -236,11 +246,12 @@ async function runTests() {
     // TEST 8: Automated Cleanup Maintenance Job
     // ----------------------------------------------------
     console.log("\n--- TEST 8: Cleanup Maintenance Job ---");
+    const cronSecret = process.env.CRON_SECRET || process.env.TRANSFER_CODE_SECRET || "";
     const cleanupRes = await fetch(`${BASE_URL}/api/transfers/cleanup`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": "Bearer c8e3f29b48d21a97e4165d3098f4a132bc6e71928347fa65e492b0174c839d2e",
+        ...(cronSecret ? { Authorization: `Bearer ${cronSecret}` } : {}),
       },
     });
     if (!cleanupRes.ok) throw new Error(`Cleanup failed: ${cleanupRes.status}`);

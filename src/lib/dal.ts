@@ -1,6 +1,10 @@
 import { prisma } from "./db";
+import type { Prisma } from "@prisma/client";
 import fs from "fs";
+import os from "os";
 import path from "path";
+
+export type JsonValue = Record<string, unknown>;
 
 export interface StoredTransfer {
   id: string;
@@ -26,6 +30,12 @@ export interface StoredTransfer {
   updatedAt: string;
 }
 
+export interface StoredUploadPart {
+  partNumber: number;
+  etag: string;
+  size?: number;
+}
+
 export interface StoredUploadSession {
   id: string;
   transferId: string;
@@ -34,7 +44,7 @@ export interface StoredUploadSession {
   uploadStatus: string;
   totalParts: number;
   partSize: number;
-  uploadedParts: { partNumber: number; etag: string; size?: number }[];
+  uploadedParts: StoredUploadPart[];
   createdAt: string;
   updatedAt: string;
 }
@@ -43,7 +53,7 @@ export interface StoredTransferEvent {
   id: string;
   transferId: string;
   eventType: string;
-  metadata?: any;
+  metadata?: unknown;
   ipHash?: string | null;
   createdAt: string;
 }
@@ -54,8 +64,22 @@ interface LocalDatabase {
   events: StoredTransferEvent[];
 }
 
-const DATA_DIR = path.join(process.cwd(), ".data");
+// Use os.tmpdir() on Vercel serverless (where process.cwd() is read-only)
+const DATA_DIR = process.env.VERCEL
+  ? path.join(os.tmpdir(), "v-share-data")
+  : path.join(process.cwd(), ".data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
+
+function parseUploadedParts(raw: unknown): StoredUploadPart[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (item): item is StoredUploadPart =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof (item as StoredUploadPart).partNumber === "number" &&
+      typeof (item as StoredUploadPart).etag === "string"
+  );
+}
 
 function ensureLocalDb(): LocalDatabase {
   if (!fs.existsSync(DATA_DIR)) {
@@ -156,7 +180,7 @@ export async function createTransfer(data: {
   const hasPrisma = await checkPrisma();
   const id = `tr_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       const record = await prisma.transfer.create({
         data: {
@@ -224,7 +248,7 @@ export async function createTransfer(data: {
 
 export async function getTransferById(id: string): Promise<StoredTransfer | null> {
   const hasPrisma = await checkPrisma();
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       const record = await prisma.transfer.findUnique({ where: { id } });
       if (!record) return null;
@@ -244,7 +268,7 @@ export async function getTransferById(id: string): Promise<StoredTransfer | null
 
 export async function getTransferByCodeHash(codeLookupHash: string): Promise<StoredTransfer | null> {
   const hasPrisma = await checkPrisma();
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       const record = await prisma.transfer.findUnique({ where: { codeLookupHash } });
       if (!record) return null;
@@ -272,12 +296,14 @@ export async function updateTransfer(
   data: Partial<Omit<StoredTransfer, "id" | "createdAt" | "updatedAt">>
 ): Promise<StoredTransfer | null> {
   const hasPrisma = await checkPrisma();
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
-      const updateData: any = { ...data };
-      if (data.fileSize !== undefined) {
-        updateData.fileSize = BigInt(data.fileSize);
-      }
+      const { fileSize, expiresAt, ...rest } = data;
+      const updateData: Prisma.TransferUpdateInput = {
+        ...rest,
+        ...(fileSize !== undefined ? { fileSize: BigInt(fileSize) } : {}),
+        ...(expiresAt !== undefined ? { expiresAt: new Date(expiresAt) } : {}),
+      };
       const record = await prisma.transfer.update({
         where: { id },
         data: updateData,
@@ -309,7 +335,7 @@ export async function updateTransfer(
 
 export async function incrementDownloadCount(id: string): Promise<number> {
   const hasPrisma = await checkPrisma();
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       const record = await prisma.transfer.update({
         where: { id },
@@ -339,7 +365,7 @@ export async function createUploadSession(data: {
   const hasPrisma = await checkPrisma();
   const id = `us_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       const record = await prisma.uploadSession.create({
         data: {
@@ -354,7 +380,7 @@ export async function createUploadSession(data: {
       });
       return {
         ...record,
-        uploadedParts: (record.uploadedParts as any) || [],
+        uploadedParts: parseUploadedParts(record.uploadedParts),
         createdAt: record.createdAt.toISOString(),
         updatedAt: record.updatedAt.toISOString(),
       };
@@ -383,13 +409,13 @@ export async function createUploadSession(data: {
 
 export async function getUploadSession(sessionId: string): Promise<StoredUploadSession | null> {
   const hasPrisma = await checkPrisma();
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       const record = await prisma.uploadSession.findUnique({ where: { id: sessionId } });
       if (!record) return null;
       return {
         ...record,
-        uploadedParts: (record.uploadedParts as any) || [],
+        uploadedParts: parseUploadedParts(record.uploadedParts),
         createdAt: record.createdAt.toISOString(),
         updatedAt: record.updatedAt.toISOString(),
       };
@@ -405,15 +431,22 @@ export async function updateUploadSession(
   data: Partial<Omit<StoredUploadSession, "id" | "createdAt" | "updatedAt">>
 ): Promise<StoredUploadSession | null> {
   const hasPrisma = await checkPrisma();
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
+      const { uploadedParts, ...rest } = data;
+      const updateData: Prisma.UploadSessionUpdateInput = {
+        ...rest,
+        ...(uploadedParts !== undefined
+          ? { uploadedParts: uploadedParts as unknown as Prisma.InputJsonValue }
+          : {}),
+      };
       const record = await prisma.uploadSession.update({
         where: { id: sessionId },
-        data: data as any,
+        data: updateData,
       });
       return {
         ...record,
-        uploadedParts: (record.uploadedParts as any) || [],
+        uploadedParts: parseUploadedParts(record.uploadedParts),
         createdAt: record.createdAt.toISOString(),
         updatedAt: record.updatedAt.toISOString(),
       };
@@ -438,19 +471,19 @@ export async function updateUploadSession(
 export async function createTransferEvent(
   transferId: string,
   eventType: string,
-  metadata: any = {},
+  metadata: Record<string, unknown> = {},
   ipHash?: string
 ): Promise<StoredTransferEvent> {
   const hasPrisma = await checkPrisma();
   const id = `ev_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       const record = await prisma.transferEvent.create({
         data: {
           transferId,
           eventType,
-          metadata,
+          metadata: metadata as Prisma.InputJsonValue,
           ipHash: ipHash || null,
         },
       });
@@ -478,13 +511,13 @@ export async function createTransferEvent(
 
 export async function getTransferEvents(transferId: string): Promise<StoredTransferEvent[]> {
   const hasPrisma = await checkPrisma();
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       const records = await prisma.transferEvent.findMany({
         where: { transferId },
         orderBy: { createdAt: "asc" },
       });
-      return records.map((r: any) => ({
+      return records.map((r) => ({
         ...r,
         createdAt: r.createdAt.toISOString(),
       }));
@@ -500,7 +533,7 @@ export async function getTransferEvents(transferId: string): Promise<StoredTrans
 export async function getExpiredTransfers(): Promise<StoredTransfer[]> {
   const now = new Date();
   const hasPrisma = await checkPrisma();
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       const records = await prisma.transfer.findMany({
         where: {
@@ -508,7 +541,7 @@ export async function getExpiredTransfers(): Promise<StoredTransfer[]> {
           uploadStatus: { not: "expired" },
         },
       });
-      return records.map((r: any) => ({
+      return records.map((r) => ({
         ...r,
         fileSize: Number(r.fileSize),
         createdAt: r.createdAt.toISOString(),
@@ -536,7 +569,7 @@ export async function markTransferExpired(id: string): Promise<void> {
 
 export async function deleteTransfer(id: string): Promise<void> {
   const hasPrisma = await checkPrisma();
-  if (hasPrisma) {
+  if (hasPrisma && prisma) {
     try {
       await prisma.transfer.delete({ where: { id } });
       return;

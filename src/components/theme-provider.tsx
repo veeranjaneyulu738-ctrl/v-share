@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useContext, useEffect, useState, useCallback } from "react";
+import { createContext, useContext, useCallback, useSyncExternalStore } from "react";
 
 type Theme = "light" | "dark";
 
@@ -18,35 +18,52 @@ export function useTheme() {
   return useContext(ThemeContext);
 }
 
+const themeListeners = new Set<() => void>();
+
+function subscribeTheme(callback: () => void) {
+  themeListeners.add(callback);
+  const onStorage = (e: StorageEvent) => {
+    if (e.key === "vl-theme") callback();
+  };
+  window.addEventListener("storage", onStorage);
+  return () => {
+    themeListeners.delete(callback);
+    window.removeEventListener("storage", onStorage);
+  };
+}
+
+function getThemeSnapshot(): Theme {
+  const attr = document.documentElement.getAttribute("data-theme");
+  if (attr === "dark" || attr === "light") return attr;
+  try {
+    const stored = localStorage.getItem("vl-theme");
+    if (stored === "dark" || stored === "light") return stored;
+  } catch {}
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function getThemeServerSnapshot(): Theme {
+  return "light";
+}
+
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setTheme] = useState<Theme>("light");
-  const [mounted, setMounted] = useState(false);
-
-  useEffect(() => {
-    setMounted(true);
-    const stored = localStorage.getItem("vl-theme") as Theme | null;
-    if (stored === "dark" || stored === "light") {
-      setTheme(stored);
-    } else if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
-      setTheme("dark");
-    }
-  }, []);
-
-  useEffect(() => {
-    if (mounted) {
-      document.documentElement.setAttribute("data-theme", theme);
-      localStorage.setItem("vl-theme", theme);
-    }
-  }, [theme, mounted]);
+  const theme = useSyncExternalStore(
+    subscribeTheme,
+    getThemeSnapshot,
+    getThemeServerSnapshot
+  );
 
   const toggleTheme = useCallback(() => {
-    setTheme((prev) => (prev === "light" ? "dark" : "light"));
+    const current = getThemeSnapshot();
+    const next: Theme = current === "light" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", next);
+    try {
+      localStorage.setItem("vl-theme", next);
+    } catch {}
+    for (const listener of themeListeners) {
+      listener();
+    }
   }, []);
-
-  // Prevent flash of wrong theme
-  if (!mounted) {
-    return <>{children}</>;
-  }
 
   return (
     <ThemeContext.Provider value={{ theme, toggleTheme }}>

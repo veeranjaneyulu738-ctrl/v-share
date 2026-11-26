@@ -1,6 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getTransferById, createTransferEvent, getTransferEvents } from "@/lib/dal";
 
+type SignalType = "offer" | "answer" | "candidate" | "status" | "cancel";
+type SignalRole = "sender" | "receiver";
+
+interface SignalMetadata {
+  from?: SignalRole;
+  data?: unknown;
+  timestamp?: number;
+}
+
+const ALLOWED_TYPES: ReadonlySet<string> = new Set([
+  "offer",
+  "answer",
+  "candidate",
+  "status",
+  "cancel",
+]);
+
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -11,16 +28,19 @@ export async function POST(
     if (!transfer) {
       return NextResponse.json({ error: "Transfer not found" }, { status: 404 });
     }
+    if (new Date() > new Date(transfer.expiresAt)) {
+      return NextResponse.json({ error: "Transfer has expired" }, { status: 410 });
+    }
 
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
     const { type, data, from } = body as {
-      type: "offer" | "answer" | "candidate" | "status";
-      data: any;
-      from: "sender" | "receiver";
+      type?: SignalType;
+      data?: unknown;
+      from?: SignalRole;
     };
 
-    if (!type || !from) {
-      return NextResponse.json({ error: "Type and from role required" }, { status: 400 });
+    if (!type || !ALLOWED_TYPES.has(type) || (from !== "sender" && from !== "receiver")) {
+      return NextResponse.json({ error: "Valid type and from role required" }, { status: 400 });
     }
 
     const event = await createTransferEvent(
@@ -28,7 +48,7 @@ export async function POST(
       `webrtc_${type}`,
       {
         from,
-        data,
+        data: data ?? null,
         timestamp: Date.now(),
       }
     );
@@ -51,7 +71,8 @@ export async function GET(
     const { id: transferId } = await params;
     const url = new URL(req.url);
     const forRole = url.searchParams.get("role"); // "sender" wants messages from "receiver", and vice versa
-    const sinceTimestamp = parseInt(url.searchParams.get("since") || "0", 10);
+    const rawSince = parseInt(url.searchParams.get("since") || "0", 10);
+    const sinceTimestamp = Number.isFinite(rawSince) ? rawSince : 0;
 
     const allEvents = await getTransferEvents(transferId);
 
@@ -60,7 +81,9 @@ export async function GET(
       .filter((e) => e.eventType.startsWith("webrtc_"))
       .map((e) => {
         const type = e.eventType.replace("webrtc_", "");
-        const meta = e.metadata || {};
+        const meta = (
+          typeof e.metadata === "object" && e.metadata !== null ? e.metadata : {}
+        ) as SignalMetadata;
         return {
           id: e.id,
           type,

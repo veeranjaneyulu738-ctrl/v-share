@@ -1,7 +1,6 @@
 // ==============================================
-// VIDELINK — Ultra High-Speed Multi-Channel WebRTC P2P Engine
-// 4x Parallel Unordered DataChannels + Custom Sequence Reassembly
-// Designed to saturate full mobile network bandwidth (4G/5G)
+// VIDELINK — High-Speed Multi-Channel WebRTC P2P Engine
+// 4x Parallel Unordered Reliable DataChannels + Sequence Reassembly
 // ==============================================
 
 export const ICE_SERVERS: RTCConfiguration = {
@@ -20,7 +19,7 @@ export const ICE_SERVERS: RTCConfiguration = {
 
 // ===== Speed-Tuned Constants =====
 // Each channel uses 64KB chunks. With 4 parallel channels, aggregate burst = 256 KB per cycle.
-// Total in-flight buffer across all channels: 4 x 4 MB = 16 MB, allowing massive burst throughput.
+// Total in-flight buffer across all channels: 4 x 4 MB = 16 MB.
 const NUM_CHANNELS = 4; // Number of parallel DataChannels
 const PACKET_CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
 const DISK_READ_BLOCK_SIZE = 4 * 1024 * 1024; // 4 MB disk read block
@@ -60,11 +59,25 @@ export type P2PStatus =
   | "cancelled"
   | "failed";
 
+interface SignalRecord {
+  id: string;
+  type: string;
+  from?: "sender" | "receiver";
+  data?: unknown;
+  timestamp: number;
+}
+
+interface CancelSignalData {
+  status?: string;
+  by?: "sender" | "receiver";
+  reason?: string;
+}
+
 // ===== Signaling Helpers =====
 export async function sendSignal(
   transferId: string,
   type: "offer" | "answer" | "candidate" | "status" | "cancel",
-  data: any,
+  data: unknown,
   from: "sender" | "receiver"
 ) {
   try {
@@ -82,13 +95,13 @@ export async function fetchSignals(
   transferId: string,
   forRole: "sender" | "receiver",
   since: number = 0
-) {
+): Promise<SignalRecord[]> {
   try {
     const res = await fetch(
       `/api/transfers/${transferId}/signal?role=${forRole}&since=${since}`
     );
     if (!res.ok) return [];
-    const data = await res.json();
+    const data = (await res.json()) as { signals?: SignalRecord[] };
     return data.signals || [];
   } catch (err) {
     console.warn("Signal fetch failed:", err);
@@ -118,12 +131,13 @@ export class P2PSenderSession {
   private pc: RTCPeerConnection | null = null;
   private controlChannel: RTCDataChannel | null = null;
   private dataChannels: RTCDataChannel[] = [];
+  private pendingCandidates: RTCIceCandidateInit[] = [];
   private transferId: string;
   private files: File[];
   private totalBytes: number;
   private isDestroyed = false;
   private isCancelled = false;
-  private pollingInterval: NodeJS.Timeout | null = null;
+  private pollingInterval: ReturnType<typeof setInterval> | null = null;
   private lastSignalTime = 0;
 
   public onStatusChange?: (status: P2PStatus, message?: string) => void;
@@ -146,11 +160,11 @@ export class P2PSenderSession {
     });
     this.controlChannel.binaryType = "arraybuffer";
 
-    // Create NUM_CHANNELS parallel unordered data channels for maximum throughput
+    // Create NUM_CHANNELS parallel unordered reliable data channels for maximum throughput
+    // Omitting maxRetransmits keeps SCTP reliable (zero packet drops) while avoiding head-of-line blocking
     for (let i = 0; i < NUM_CHANNELS; i++) {
       const dc = this.pc.createDataChannel(`data-${i}`, {
         ordered: false,
-        maxRetransmits: 3, // Allow a few retransmits for reliability, but not infinite
       });
       dc.binaryType = "arraybuffer";
       dc.bufferedAmountLowThreshold = LOW_WATERMARK;
@@ -187,7 +201,7 @@ export class P2PSenderSession {
     this.controlChannel.onmessage = (e) => {
       if (typeof e.data === "string") {
         try {
-          const msg = JSON.parse(e.data);
+          const msg = JSON.parse(e.data) as { type?: string; by?: "sender" | "receiver"; reason?: string };
           if (msg.type === "cancel") {
             this.handlePeerCancelled(msg.by || "receiver", msg.reason);
           }
@@ -237,6 +251,18 @@ export class P2PSenderSession {
     this.startPolling();
   }
 
+  private async flushPendingCandidates() {
+    if (!this.pc || !this.pc.remoteDescription) return;
+    while (this.pendingCandidates.length > 0) {
+      const candidate = this.pendingCandidates.shift()!;
+      try {
+        await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.error("Error adding queued ICE candidate:", e);
+      }
+    }
+  }
+
   private startPolling() {
     let answered = false;
 
@@ -247,9 +273,10 @@ export class P2PSenderSession {
 
       for (const sig of signals) {
         this.lastSignalTime = Math.max(this.lastSignalTime, sig.timestamp);
+        const cancelData = (sig.data ?? {}) as CancelSignalData;
 
-        if ((sig.type === "cancel" || sig.type === "status") && sig.data?.status === "cancelled") {
-          this.handlePeerCancelled(sig.data.by || "receiver", sig.data.reason);
+        if ((sig.type === "cancel" || sig.type === "status") && cancelData.status === "cancelled") {
+          this.handlePeerCancelled(cancelData.by || "receiver", cancelData.reason);
           return;
         }
 
@@ -257,15 +284,23 @@ export class P2PSenderSession {
           answered = true;
           this.onStatusChange?.("connecting", "Receiver joined! Connecting multi-channel...");
           try {
-            await this.pc.setRemoteDescription(new RTCSessionDescription(sig.data));
+            await this.pc.setRemoteDescription(
+              new RTCSessionDescription(sig.data as RTCSessionDescriptionInit)
+            );
+            await this.flushPendingCandidates();
           } catch (e) {
             console.error("Error setting remote description:", e);
           }
-        } else if (sig.type === "candidate" && this.pc && this.pc.remoteDescription) {
-          try {
-            await this.pc.addIceCandidate(new RTCIceCandidate(sig.data));
-          } catch (e) {
-            console.error("Error adding ICE candidate:", e);
+        } else if (sig.type === "candidate" && this.pc && sig.data) {
+          const candidateInit = sig.data as RTCIceCandidateInit;
+          if (this.pc.remoteDescription) {
+            try {
+              await this.pc.addIceCandidate(new RTCIceCandidate(candidateInit));
+            } catch (e) {
+              console.error("Error adding ICE candidate:", e);
+            }
+          } else {
+            this.pendingCandidates.push(candidateInit);
           }
         }
       }
@@ -341,13 +376,12 @@ export class P2PSenderSession {
           name: file.name,
           size: file.size,
           mimeType: file.type || "video/mp4",
-          startSeq: globalSeq, // Tell receiver what sequence number this file starts at
+          startSeq: globalSeq,
         })
       );
 
       let fileOffset = 0;
       const fileSize = file.size;
-      const fileChunkCount = Math.ceil(fileSize / PACKET_CHUNK_SIZE);
 
       while (fileOffset < fileSize && !this.isDestroyed && !this.isCancelled) {
         const blockEnd = Math.min(fileOffset + DISK_READ_BLOCK_SIZE, fileSize);
@@ -424,12 +458,12 @@ export class P2PSenderSession {
 
       if (this.isDestroyed || this.isCancelled) return;
 
-      // Send file end marker on control channel with the sequence range
+      // Send file end marker on control channel with the exclusive end sequence number
       this.controlChannel.send(
         JSON.stringify({
           type: "file_end",
           fileIndex,
-          endSeq: globalSeq, // Total chunks sent for this file
+          endSeq: globalSeq,
           totalChunks: Math.ceil(file.size / PACKET_CHUNK_SIZE),
         })
       );
@@ -441,13 +475,13 @@ export class P2PSenderSession {
       // Wait for all channel buffers to flush before declaring complete
       for (const dc of this.dataChannels) {
         while (dc.bufferedAmount > 0) {
-          await new Promise(r => setTimeout(r, 50));
+          await new Promise((r) => setTimeout(r, 50));
           if (this.isDestroyed || this.isCancelled) return;
         }
       }
 
       // Small delay to let receiver process remaining chunks
-      await new Promise(r => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 300));
 
       // Send batch complete marker on control channel
       this.controlChannel.send(JSON.stringify({ type: "batch_complete", totalSeq: globalSeq }));
@@ -477,7 +511,9 @@ export class P2PSenderSession {
   private handlePeerCancelled(by: "sender" | "receiver", reason?: string) {
     if (this.isCancelled || this.isDestroyed) return;
     this.isCancelled = true;
-    const message = by === "sender" ? "Transfer cancelled by sender" : "Transfer was cancelled by recipient";
+    const message =
+      reason ||
+      (by === "sender" ? "Transfer cancelled by sender" : "Transfer was cancelled by recipient");
     this.onStatusChange?.("cancelled", message);
     this.destroy();
   }
@@ -504,10 +540,11 @@ export class P2PReceiverSession {
   private pc: RTCPeerConnection | null = null;
   private controlChannel: RTCDataChannel | null = null;
   private dataChannels: RTCDataChannel[] = [];
+  private pendingCandidates: RTCIceCandidateInit[] = [];
   private transferId: string;
   private isDestroyed = false;
   private isCancelled = false;
-  private pollingInterval: NodeJS.Timeout | null = null;
+  private pollingInterval: ReturnType<typeof setInterval> | null = null;
   private lastSignalTime = 0;
 
   // Stream state
@@ -520,12 +557,9 @@ export class P2PReceiverSession {
   private currentFileIndex = 0;
   private currentFileMeta: P2PFileMeta | null = null;
   private currentFileReceivedBytes = 0;
-  private currentFileStartSeq = 0;
-  private currentFileExpectedChunks = 0;
+  private currentFileEndSeq: number | null = null;
 
   // Sequence-ordered chunk reassembly buffer
-  // For unordered channels, chunks may arrive out of order.
-  // We use a Map<seq, ArrayBuffer> and flush sequentially.
   private chunkMap: Map<number, ArrayBuffer> = new Map();
   private nextExpectedSeq = 0;
   private flushedBlobs: Blob[] = [];
@@ -561,19 +595,28 @@ export class P2PReceiverSession {
       }
     };
 
+    const maybeStopPolling = () => {
+      const controlReady = this.controlChannel?.readyState === "open";
+      const openDataCount = this.dataChannels.filter((dc) => dc.readyState === "open").length;
+      if (this.pollingInterval && controlReady && openDataCount >= NUM_CHANNELS) {
+        clearInterval(this.pollingInterval);
+        this.pollingInterval = null;
+      }
+    };
+
     // When Sender's DataChannels arrive
     this.pc.ondatachannel = (event) => {
       const channel = event.channel;
       channel.binaryType = "arraybuffer";
 
       if (channel.label === "control") {
-        // Control channel for metadata messages
         this.controlChannel = channel;
 
         channel.onopen = () => {
           this.onStatusChange?.("streaming", "Control channel established!");
           this.startTime = Date.now();
           this.lastProgressTime = this.startTime;
+          maybeStopPolling();
         };
 
         channel.onmessage = (e) => {
@@ -582,14 +625,10 @@ export class P2PReceiverSession {
           }
         };
       } else if (channel.label.startsWith("data-")) {
-        // Data channel for binary chunks
         this.dataChannels.push(channel);
 
         channel.onopen = () => {
-          if (this.pollingInterval && this.dataChannels.length >= NUM_CHANNELS) {
-            clearInterval(this.pollingInterval);
-            this.pollingInterval = null;
-          }
+          maybeStopPolling();
           this.onStatusChange?.("streaming", `${this.dataChannels.length} data channels active! Receiving at maximum speed...`);
         };
 
@@ -621,36 +660,51 @@ export class P2PReceiverSession {
 
   private handleControlMessage(data: string) {
     try {
-      const msg = JSON.parse(data);
+      const msg = JSON.parse(data) as {
+        type?: string;
+        by?: "sender" | "receiver";
+        reason?: string;
+        totalFiles?: number;
+        totalBytes?: number;
+        files?: P2PFileMeta[];
+        fileIndex?: number;
+        name?: string;
+        size?: number;
+        mimeType?: string;
+        startSeq?: number;
+        endSeq?: number;
+      };
       if (msg.type === "cancel") {
         this.handlePeerCancelled(msg.by || "sender", msg.reason);
         return;
       } else if (msg.type === "manifest") {
-        this.totalFiles = msg.totalFiles;
-        this.totalBytes = msg.totalBytes;
+        this.totalFiles = msg.totalFiles ?? 1;
+        this.totalBytes = msg.totalBytes ?? 0;
         this.fileList = msg.files || [];
         this.onManifestReceived?.(this.fileList, this.totalBytes);
       } else if (msg.type === "file_start") {
         this.currentFileIndex = msg.fileIndex ?? 0;
         this.currentFileMeta = {
           index: msg.fileIndex ?? 0,
-          name: msg.name,
-          size: msg.size,
-          mimeType: msg.mimeType,
+          name: msg.name || `video_${(msg.fileIndex ?? 0) + 1}.mp4`,
+          size: msg.size ?? 0,
+          mimeType: msg.mimeType || "video/mp4",
         };
         this.currentFileReceivedBytes = 0;
-        this.currentFileStartSeq = msg.startSeq ?? this.nextExpectedSeq;
+        this.currentFileEndSeq = null;
         this.flushedBlobs = [];
         this.pendingFlushSize = 0;
-        // Don't clear chunkMap — there may be pre-arrived out-of-order chunks
+        if (typeof msg.startSeq === "number") {
+          this.nextExpectedSeq = msg.startSeq;
+        }
       } else if (msg.type === "file_end") {
-        // Flush any remaining buffered chunks for this file
-        this.flushSequentialChunks();
-        this.finalizeCurrentFile();
+        const endSeq = typeof msg.endSeq === "number" ? msg.endSeq : undefined;
+        this.currentFileEndSeq = endSeq ?? null;
+        this.flushSequentialChunks(endSeq);
+        this.finalizeCurrentFile(endSeq);
       } else if (msg.type === "batch_complete" || msg.type === "complete") {
-        // Flush any remaining
         this.flushSequentialChunks();
-        if (this.flushedBlobs.length > 0 || this.chunkMap.size > 0) {
+        if (this.currentFileMeta && (this.flushedBlobs.length > 0 || this.chunkMap.size > 0)) {
           this.finalizeCurrentFile();
         }
         this.onStatusChange?.("completed", "All files received successfully in original quality!");
@@ -662,19 +716,16 @@ export class P2PReceiverSession {
   private handleDataChunk(data: ArrayBuffer) {
     if (data.byteLength <= SEQ_HEADER_SIZE) return;
 
-    // Extract sequence number from 4-byte header
     const seq = decodeSeqHeader(data);
     const payload = data.slice(SEQ_HEADER_SIZE);
 
-    // Store in map
     this.chunkMap.set(seq, payload);
     this.currentFileReceivedBytes += payload.byteLength;
     this.totalReceivedBytes += payload.byteLength;
 
-    // Try to flush sequential chunks from the map
-    this.flushSequentialChunks();
+    // Only flush chunks up to currentFileEndSeq if known
+    this.flushSequentialChunks(this.currentFileEndSeq ?? undefined);
 
-    // Throttle progress updates to 150ms
     const now = Date.now();
     if (now - this.lastProgressTime > 150 || this.totalReceivedBytes === this.totalBytes) {
       const elapsed = (now - this.startTime) / 1000;
@@ -704,19 +755,21 @@ export class P2PReceiverSession {
     }
   }
 
-  // Flush chunks that are in sequential order starting from nextExpectedSeq
-  private flushSequentialChunks() {
+  // Flush chunks in sequential order starting from nextExpectedSeq (optionally bounded by maxSeqExclusive)
+  private flushSequentialChunks(maxSeqExclusive?: number) {
     const BLOB_CONSOLIDATION_SIZE = 8 * 1024 * 1024; // 8 MB
     const batchChunks: ArrayBuffer[] = [];
 
-    while (this.chunkMap.has(this.nextExpectedSeq)) {
+    while (
+      (maxSeqExclusive === undefined || this.nextExpectedSeq < maxSeqExclusive) &&
+      this.chunkMap.has(this.nextExpectedSeq)
+    ) {
       const chunk = this.chunkMap.get(this.nextExpectedSeq)!;
       this.chunkMap.delete(this.nextExpectedSeq);
       batchChunks.push(chunk);
       this.pendingFlushSize += chunk.byteLength;
       this.nextExpectedSeq++;
 
-      // Consolidate into a Blob every 8MB to prevent GC pressure
       if (this.pendingFlushSize >= BLOB_CONSOLIDATION_SIZE) {
         this.flushedBlobs.push(new Blob(batchChunks));
         batchChunks.length = 0;
@@ -724,40 +777,43 @@ export class P2PReceiverSession {
       }
     }
 
-    // Store remaining batch chunks
     if (batchChunks.length > 0) {
       this.flushedBlobs.push(new Blob(batchChunks));
     }
   }
 
-  private finalizeCurrentFile() {
+  private finalizeCurrentFile(endSeq?: number) {
     if (!this.currentFileMeta) return;
 
-    // Flush any remaining in the map
-    this.flushSequentialChunks();
+    this.flushSequentialChunks(endSeq);
 
-    // If there are still out-of-order chunks in the map, force-flush them
-    // (This handles edge cases where some chunks arrived but seq gaps exist)
+    // Flush any remaining out-of-order chunks belonging ONLY to this file (< endSeq)
     if (this.chunkMap.size > 0) {
-      const sortedSeqs = Array.from(this.chunkMap.keys()).sort((a, b) => a - b);
-      const remainingChunks: ArrayBuffer[] = [];
-      for (const seq of sortedSeqs) {
-        remainingChunks.push(this.chunkMap.get(seq)!);
-        this.chunkMap.delete(seq);
-      }
-      if (remainingChunks.length > 0) {
+      const sortedSeqs = Array.from(this.chunkMap.keys())
+        .filter((seq) => endSeq === undefined || seq < endSeq)
+        .sort((a, b) => a - b);
+      if (sortedSeqs.length > 0) {
+        const remainingChunks: ArrayBuffer[] = [];
+        for (const seq of sortedSeqs) {
+          remainingChunks.push(this.chunkMap.get(seq)!);
+          this.chunkMap.delete(seq);
+        }
         this.flushedBlobs.push(new Blob(remainingChunks));
+        this.nextExpectedSeq = Math.max(
+          this.nextExpectedSeq,
+          (sortedSeqs[sortedSeqs.length - 1] ?? this.nextExpectedSeq) + 1
+        );
       }
-      this.nextExpectedSeq = (sortedSeqs[sortedSeqs.length - 1] ?? this.nextExpectedSeq) + 1;
     }
 
     const filename = this.currentFileMeta.name || `video_${this.currentFileIndex + 1}.mp4`;
     const mimeType = this.currentFileMeta.mimeType || "video/mp4";
     const blob = new Blob(this.flushedBlobs, { type: mimeType });
 
-    // Release blob chunks from memory
     this.flushedBlobs = [];
     this.pendingFlushSize = 0;
+    this.currentFileMeta = null;
+    this.currentFileEndSeq = null;
 
     this.onFileReceived?.(blob, filename, this.currentFileIndex, this.totalFiles);
 
@@ -776,6 +832,18 @@ export class P2PReceiverSession {
     }
   }
 
+  private async flushPendingCandidates() {
+    if (!this.pc || !this.pc.remoteDescription) return;
+    while (this.pendingCandidates.length > 0) {
+      const candidate = this.pendingCandidates.shift()!;
+      try {
+        await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.error("Error adding queued candidate:", e);
+      }
+    }
+  }
+
   private startReceiverPolling() {
     let answered = false;
 
@@ -786,9 +854,10 @@ export class P2PReceiverSession {
 
       for (const sig of signals) {
         this.lastSignalTime = Math.max(this.lastSignalTime, sig.timestamp);
+        const cancelData = (sig.data ?? {}) as CancelSignalData;
 
-        if ((sig.type === "cancel" || sig.type === "status") && sig.data?.status === "cancelled") {
-          this.handlePeerCancelled(sig.data.by || "sender", sig.data.reason);
+        if ((sig.type === "cancel" || sig.type === "status") && cancelData.status === "cancelled") {
+          this.handlePeerCancelled(cancelData.by || "sender", cancelData.reason);
           return;
         }
 
@@ -797,7 +866,10 @@ export class P2PReceiverSession {
           this.onStatusChange?.("connecting", "Connecting to sender...");
 
           try {
-            await this.pc.setRemoteDescription(new RTCSessionDescription(sig.data));
+            await this.pc.setRemoteDescription(
+              new RTCSessionDescription(sig.data as RTCSessionDescriptionInit)
+            );
+            await this.flushPendingCandidates();
             const answer = await this.pc.createAnswer();
             await this.pc.setLocalDescription(answer);
 
@@ -810,11 +882,16 @@ export class P2PReceiverSession {
           } catch (e) {
             console.error("Error responding to offer:", e);
           }
-        } else if (sig.type === "candidate" && this.pc && this.pc.remoteDescription) {
-          try {
-            await this.pc.addIceCandidate(new RTCIceCandidate(sig.data));
-          } catch (e) {
-            console.error("Error adding candidate:", e);
+        } else if (sig.type === "candidate" && this.pc && sig.data) {
+          const candidateInit = sig.data as RTCIceCandidateInit;
+          if (this.pc.remoteDescription) {
+            try {
+              await this.pc.addIceCandidate(new RTCIceCandidate(candidateInit));
+            } catch (e) {
+              console.error("Error adding candidate:", e);
+            }
+          } else {
+            this.pendingCandidates.push(candidateInit);
           }
         }
       }
@@ -841,7 +918,9 @@ export class P2PReceiverSession {
   private handlePeerCancelled(by: "sender" | "receiver", reason?: string) {
     if (this.isCancelled || this.isDestroyed) return;
     this.isCancelled = true;
-    const message = by === "sender" ? "Transfer was cancelled by sender" : "Transfer was cancelled by recipient";
+    const message =
+      reason ||
+      (by === "sender" ? "Transfer was cancelled by sender" : "Transfer was cancelled by recipient");
     this.onStatusChange?.("cancelled", message);
     this.destroy();
   }

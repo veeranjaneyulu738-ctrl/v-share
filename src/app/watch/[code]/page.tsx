@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, use, Suspense } from "react";
+import { useEffect, useState, useRef, use, Suspense, useCallback } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { formatFileSize } from "@/lib/types";
@@ -31,12 +31,30 @@ function WatchPageContent({ params }: { params: Promise<{ code: string }> }) {
   const [downloading, setDownloading] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [volume, setVolume] = useState(1);
-  const [isMuted, setIsMuted] = useState(false);
   const [playbackError, setPlaybackError] = useState(false);
+
+  const loadPreview = useCallback(async (passToTry?: string) => {
+    const res = await fetch("/api/transfers/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code,
+        ...(passToTry ? { password: passToTry } : {}),
+      }),
+    });
+
+    if (res.status === 401) {
+      return { unauthorized: true as const };
+    }
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Could not load video (${res.status})`);
+    }
+
+    const data = (await res.json()) as VideoData;
+    return { unauthorized: false as const, data };
+  }, [code]);
 
   const fetchPreview = async (passToTry?: string) => {
     setLoading(true);
@@ -44,31 +62,15 @@ function WatchPageContent({ params }: { params: Promise<{ code: string }> }) {
     setPasswordError(null);
 
     try {
-      const res = await fetch("/api/transfers/preview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          code,
-          ...(passToTry ? { password: passToTry } : {}),
-        }),
-      });
-
-      if (res.status === 401) {
+      const result = await loadPreview(passToTry);
+      if (result.unauthorized) {
         setPasswordRequired(true);
         if (passToTry) {
           setPasswordError("Incorrect password. Please try again.");
         }
-        setLoading(false);
         return;
       }
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || `Could not load video (${res.status})`);
-      }
-
-      const data = await res.json();
-      setVideoData(data);
+      setVideoData(result.data);
       setPasswordRequired(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Error loading video");
@@ -78,8 +80,32 @@ function WatchPageContent({ params }: { params: Promise<{ code: string }> }) {
   };
 
   useEffect(() => {
-    fetchPreview(initialPassword);
-  }, [code]);
+    let cancelled = false;
+    loadPreview(initialPassword)
+      .then((result) => {
+        if (cancelled) return;
+        if (result.unauthorized) {
+          setPasswordRequired(true);
+          if (initialPassword) {
+            setPasswordError("Incorrect password. Please try again.");
+          }
+        } else {
+          setVideoData(result.data);
+          setPasswordRequired(false);
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : "Error loading video");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [loadPreview, initialPassword]);
 
   const handleDownloadOriginal = async () => {
     setDownloading(true);
@@ -110,23 +136,6 @@ function WatchPageContent({ params }: { params: Promise<{ code: string }> }) {
     } finally {
       setDownloading(false);
     }
-  };
-
-  const togglePlay = () => {
-    if (!videoRef.current) return;
-    if (videoRef.current.paused) {
-      videoRef.current.play();
-      setIsPlaying(true);
-    } else {
-      videoRef.current.pause();
-      setIsPlaying(false);
-    }
-  };
-
-  const formatTime = (secs: number) => {
-    const m = Math.floor(secs / 60);
-    const s = Math.floor(secs % 60);
-    return `${m}:${s < 10 ? "0" : ""}${s}`;
   };
 
   return (
@@ -226,18 +235,6 @@ function WatchPageContent({ params }: { params: Promise<{ code: string }> }) {
                 className="w-full max-h-[70vh] aspect-video object-contain bg-black"
                 playsInline
                 controls
-                onPlay={() => setIsPlaying(true)}
-                onPause={() => setIsPlaying(false)}
-                onTimeUpdate={() => {
-                  if (videoRef.current) {
-                    setCurrentTime(videoRef.current.currentTime);
-                  }
-                }}
-                onLoadedMetadata={() => {
-                  if (videoRef.current) {
-                    setDuration(videoRef.current.duration);
-                  }
-                }}
                 onError={() => setPlaybackError(true)}
               />
 

@@ -6,7 +6,7 @@ import {
   updateUploadSession,
   createTransferEvent,
 } from "@/lib/dal";
-import { completeMultipartUpload, headObject } from "@/lib/storage";
+import { completeMultipartUpload, headObject, isMockMode } from "@/lib/storage";
 
 export async function POST(
   req: NextRequest,
@@ -47,7 +47,8 @@ export async function POST(
       }
     } catch (e) {
       console.warn("Head object verification warning:", e);
-      verified = true; // Still allow if storage backend head is eventual
+      // In mock mode, object should be readable immediately; only allow eventual consistency on remote S3/R2
+      verified = !isMockMode();
     }
 
     const integrityStatus = verified ? "verified" : "pending";

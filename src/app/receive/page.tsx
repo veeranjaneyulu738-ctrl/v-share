@@ -9,27 +9,38 @@ import {
   TRANSFER_CODE_REGEX,
   type TransferPublicInfo,
 } from "@/lib/types";
-import { P2PReceiverSession, type P2PProgress, type P2PStatus } from "@/lib/webrtc";
+import { P2PReceiverSession, type P2PFileMeta, type P2PProgress, type P2PStatus } from "@/lib/webrtc";
 
 type ReceiveStep = "input" | "loading" | "password" | "details" | "error";
 
 function ReceivePageContent() {
   const searchParams = useSearchParams();
+  const urlCode = searchParams.get("code");
+  const [prevUrlCode, setPrevUrlCode] = useState(urlCode);
   const [step, setStep] = useState<ReceiveStep>("input");
-  const [codeInput, setCodeInput] = useState("");
+  const [codeInput, setCodeInput] = useState(() =>
+    urlCode ? normalizeTransferCode(urlCode) : ""
+  );
+  if (urlCode !== prevUrlCode) {
+    setPrevUrlCode(urlCode);
+    if (urlCode) {
+      setCodeInput(normalizeTransferCode(urlCode));
+    }
+  }
+
   const [transfer, setTransfer] = useState<TransferPublicInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [password, setPassword] = useState("");
   const [passwordError, setPasswordError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
-  const [events, setEvents] = useState<{ id: string; eventType: string; createdAt: string; metadata?: any }[] | null>(null);
+  const [events, setEvents] = useState<{ id: string; eventType: string; createdAt: string; metadata?: Record<string, unknown> }[] | null>(null);
   const [loadingEvents, setLoadingEvents] = useState(false);
   const [showPassport, setShowPassport] = useState(false);
 
   // P2P Streaming states
   const [p2pStatus, setP2pStatus] = useState<P2PStatus | null>(null);
   const [p2pStatusMsg, setP2pStatusMsg] = useState<string>("");
-  const [manifestFiles, setManifestFiles] = useState<{ name: string; size: number; mimeType: string }[]>([]);
+  const [manifestFiles, setManifestFiles] = useState<P2PFileMeta[]>([]);
   const [receivedFiles, setReceivedFiles] = useState<{ filename: string; blob: Blob; url: string; size: number }[]>([]);
   const [p2pProgress, setP2pProgress] = useState<P2PProgress>({
     bytesTransferred: 0,
@@ -59,11 +70,14 @@ function ReceivePageContent() {
 
     window.addEventListener("beforeunload", handleBeforeUnload);
 
-    let wakeLock: any = null;
+    let wakeLock: WakeLockSentinel | null = null;
     if (typeof navigator !== "undefined" && "wakeLock" in navigator) {
-      (navigator as any).wakeLock.request("screen").then((lock: any) => {
-        wakeLock = lock;
-      }).catch(() => {});
+      navigator.wakeLock
+        .request("screen")
+        .then((lock) => {
+          wakeLock = lock;
+        })
+        .catch(() => {});
     }
 
     return () => {
@@ -73,14 +87,6 @@ function ReceivePageContent() {
       }
     };
   }, [p2pStatus]);
-
-  // Pre-fill code from URL query
-  useEffect(() => {
-    const urlCode = searchParams.get("code");
-    if (urlCode) {
-      setCodeInput(normalizeTransferCode(urlCode));
-    }
-  }, [searchParams]);
 
   // ===== Format code as user types =====
   const handleCodeChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -568,6 +574,13 @@ function ReceivePageContent() {
                         </span>
                       </div>
 
+                      {/* Batch file queue indicator */}
+                      {manifestFiles.length > 1 && !p2pComplete && (
+                        <div className="mt-2 mb-2 text-[11px]" style={{ color: "var(--vl-text-tertiary)" }}>
+                          Incoming batch: {manifestFiles.length} videos ({formatFileSize(manifestFiles.reduce((acc, f) => acc + f.size, 0))})
+                        </div>
+                      )}
+
                       {/* Current file in batch indicator */}
                       {p2pStatus === "streaming" && p2pProgress.totalFiles && p2pProgress.totalFiles > 1 && (
                         <div className="mt-3 mb-2 p-2.5 rounded-xl bg-[var(--vl-bg-primary)] border border-[var(--vl-border-subtle)]">
@@ -767,6 +780,7 @@ function ReceivePageContent() {
                     <div className="space-y-3">
                       {events.map((ev, idx) => {
                         const eventLabels: Record<string, { label: string; icon: string }> = {
+                          p2p_session_created: { label: "P2P Direct Session Created", icon: "⚡" },
                           upload_initiated: { label: "Transfer Initiated", icon: "📤" },
                           upload_completed: { label: "Upload Completed & Verified", icon: "📦" },
                           transfer_viewed: { label: "Transfer Accessed", icon: "👁️" },

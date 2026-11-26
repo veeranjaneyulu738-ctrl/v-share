@@ -7,7 +7,6 @@ import {
   formatDuration,
   formatSpeed,
   ALLOWED_EXTENSIONS,
-  MAX_FILE_SIZE_BYTES,
   UPLOAD_PART_SIZE,
   MAX_CONCURRENT_UPLOADS,
   EXPIRATION_PRESETS,
@@ -15,6 +14,8 @@ import {
 } from "@/lib/types";
 import QRCode from "qrcode";
 import { P2PSenderSession, type P2PProgress, type P2PStatus } from "@/lib/webrtc";
+
+const MAX_BATCH_SIZE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB limit
 
 // ===== Types =====
 type SendStep = "select" | "settings" | "uploading" | "complete";
@@ -50,7 +51,6 @@ export default function SendPage() {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const selectedFile = selectedFiles[0] || null;
   const totalSelectedSize = selectedFiles.reduce((acc, f) => acc + f.size, 0);
-  const MAX_BATCH_SIZE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB limit
 
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -138,11 +138,14 @@ export default function SendPage() {
     window.addEventListener("beforeunload", handleBeforeUnload);
 
     // Keep screen awake via Screen Wake Lock API if supported
-    let wakeLock: any = null;
+    let wakeLock: WakeLockSentinel | null = null;
     if (typeof navigator !== "undefined" && "wakeLock" in navigator) {
-      (navigator as any).wakeLock.request("screen").then((lock: any) => {
-        wakeLock = lock;
-      }).catch(() => {});
+      navigator.wakeLock
+        .request("screen")
+        .then((lock) => {
+          wakeLock = lock;
+        })
+        .catch(() => {});
     }
 
     return () => {

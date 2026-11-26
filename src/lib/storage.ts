@@ -12,10 +12,11 @@ import {
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import crypto from "crypto";
 import fs from "fs";
+import os from "os";
 import path from "path";
 
 // ===== Storage Mode Detection =====
-function isMockMode(): boolean {
+export function isMockMode(): boolean {
   if (process.env.STORAGE_MODE === "mock") return true;
   const accountId = process.env.R2_ACCOUNT_ID;
   if (!accountId || accountId.startsWith("demo-") || accountId === "your-cloudflare-account-id") {
@@ -24,8 +25,22 @@ function isMockMode(): boolean {
   return false;
 }
 
-const STORAGE_ROOT = path.join(process.cwd(), ".data", "storage");
-const CHUNKS_ROOT = path.join(process.cwd(), ".data", "chunks");
+const DATA_ROOT = process.env.VERCEL
+  ? path.join(os.tmpdir(), "v-share-data")
+  : path.join(process.cwd(), ".data");
+
+export const STORAGE_ROOT = path.join(DATA_ROOT, "storage");
+export const CHUNKS_ROOT = path.join(DATA_ROOT, "chunks");
+
+/** Resolve a user-supplied relative key safely within a root directory. */
+export function resolveSafeStoragePath(rootDir: string, unsafeSegment: string): string {
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedTarget = path.resolve(resolvedRoot, unsafeSegment);
+  if (resolvedTarget !== resolvedRoot && !resolvedTarget.startsWith(resolvedRoot + path.sep)) {
+    throw new Error("Invalid storage path");
+  }
+  return resolvedTarget;
+}
 
 function ensureDir(dirPath: string) {
   if (!fs.existsSync(dirPath)) {
@@ -98,7 +113,7 @@ export async function createMultipartUpload(
 ): Promise<string> {
   if (isMockMode()) {
     const uploadId = `mock_up_${Date.now()}_${crypto.randomBytes(6).toString("hex")}`;
-    const uploadDir = path.join(CHUNKS_ROOT, uploadId);
+    const uploadDir = resolveSafeStoragePath(CHUNKS_ROOT, uploadId);
     ensureDir(uploadDir);
     fs.writeFileSync(path.join(uploadDir, "meta.json"), JSON.stringify({ objectKey, contentType }), "utf8");
     return uploadId;
@@ -141,27 +156,38 @@ export async function completeMultipartUpload(
   parts: { partNumber: number; etag: string }[]
 ): Promise<void> {
   if (isMockMode()) {
-    const uploadDir = path.join(CHUNKS_ROOT, uploadId);
-    const targetFilePath = path.join(STORAGE_ROOT, objectKey);
+    const uploadDir = resolveSafeStoragePath(CHUNKS_ROOT, uploadId);
+    const targetFilePath = resolveSafeStoragePath(STORAGE_ROOT, objectKey);
     ensureDir(path.dirname(targetFilePath));
 
     const sortedParts = [...parts].sort((a, b) => a.partNumber - b.partNumber);
     const writeStream = fs.createWriteStream(targetFilePath);
 
-    for (const part of sortedParts) {
-      const partPath = path.join(uploadDir, `part_${part.partNumber}`);
-      if (fs.existsSync(partPath)) {
+    try {
+      for (const part of sortedParts) {
+        const partPath = resolveSafeStoragePath(uploadDir, `part_${part.partNumber}`);
+        if (!fs.existsSync(partPath)) {
+          throw new Error(
+            `Uploaded chunk ${part.partNumber} not found on storage instance. Please retry or use Direct P2P Stream.`
+          );
+        }
         const chunkData = fs.readFileSync(partPath);
         writeStream.write(chunkData);
       }
-    }
-    writeStream.end();
+      writeStream.end();
 
-    // Wait for file write to complete
-    await new Promise<void>((resolve, reject) => {
-      writeStream.on("finish", () => resolve());
-      writeStream.on("error", (err) => reject(err));
-    });
+      // Wait for file write to complete
+      await new Promise<void>((resolve, reject) => {
+        writeStream.on("finish", () => resolve());
+        writeStream.on("error", (err) => reject(err));
+      });
+    } catch (err) {
+      writeStream.destroy();
+      try {
+        if (fs.existsSync(targetFilePath)) fs.unlinkSync(targetFilePath);
+      } catch {}
+      throw err;
+    }
 
     // Cleanup chunks directory
     try {
@@ -190,8 +216,8 @@ export async function abortMultipartUpload(
   uploadId: string
 ): Promise<void> {
   if (isMockMode()) {
-    const uploadDir = path.join(CHUNKS_ROOT, uploadId);
     try {
+      const uploadDir = resolveSafeStoragePath(CHUNKS_ROOT, uploadId);
       if (fs.existsSync(uploadDir)) {
         fs.rmSync(uploadDir, { recursive: true, force: true });
       }
@@ -260,7 +286,7 @@ export async function headObject(objectKey: string): Promise<{
   etag: string;
 }> {
   if (isMockMode()) {
-    const filePath = path.join(STORAGE_ROOT, objectKey);
+    const filePath = resolveSafeStoragePath(STORAGE_ROOT, objectKey);
     if (!fs.existsSync(filePath)) {
       throw new Error(`Object not found: ${objectKey}`);
     }
@@ -288,8 +314,8 @@ export async function headObject(objectKey: string): Promise<{
 // ===== Delete Object =====
 export async function deleteObject(objectKey: string): Promise<void> {
   if (isMockMode()) {
-    const filePath = path.join(STORAGE_ROOT, objectKey);
     try {
+      const filePath = resolveSafeStoragePath(STORAGE_ROOT, objectKey);
       if (fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
       }

@@ -1,21 +1,32 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
-import path from "path";
 import crypto from "crypto";
-
-const CHUNKS_ROOT = path.join(process.cwd(), ".data", "chunks");
+import { CHUNKS_ROOT, resolveSafeStoragePath } from "@/lib/storage";
 
 export async function PUT(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
     const uploadId = searchParams.get("uploadId");
-    const partNumber = searchParams.get("partNumber");
+    const partNumberRaw = searchParams.get("partNumber");
 
-    if (!uploadId || !partNumber) {
+    if (!uploadId || !partNumberRaw) {
       return NextResponse.json({ error: "Missing uploadId or partNumber" }, { status: 400 });
     }
 
-    const uploadDir = path.join(CHUNKS_ROOT, uploadId);
+    const partNumber = Number(partNumberRaw);
+    if (!Number.isInteger(partNumber) || partNumber < 1) {
+      return NextResponse.json({ error: "Invalid partNumber" }, { status: 400 });
+    }
+
+    let uploadDir: string;
+    let partFilePath: string;
+    try {
+      uploadDir = resolveSafeStoragePath(CHUNKS_ROOT, uploadId);
+      partFilePath = resolveSafeStoragePath(uploadDir, `part_${partNumber}`);
+    } catch {
+      return NextResponse.json({ error: "Invalid uploadId" }, { status: 400 });
+    }
+
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
@@ -27,10 +38,9 @@ export async function PUT(req: NextRequest) {
     // Compute etag
     const etag = `"${crypto.createHash("md5").update(buffer).digest("hex")}"`;
 
-    const partFilePath = path.join(uploadDir, `part_${partNumber}`);
     fs.writeFileSync(partFilePath, buffer);
 
-    return new NextResponse(JSON.stringify({ etag, partNumber: Number(partNumber) }), {
+    return new NextResponse(JSON.stringify({ etag, partNumber }), {
       status: 200,
       headers: {
         "Content-Type": "application/json",

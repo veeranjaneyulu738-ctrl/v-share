@@ -1,10 +1,9 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, connection } from "next/server";
 import fs from "fs";
-import path from "path";
-
-const STORAGE_ROOT = path.join(process.cwd(), ".data", "storage");
+import { STORAGE_ROOT, resolveSafeStoragePath } from "@/lib/storage";
 
 export async function GET(req: NextRequest) {
+  await connection();
   try {
     const searchParams = req.nextUrl.searchParams;
     const key = searchParams.get("key");
@@ -14,7 +13,13 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: "Missing key" }, { status: 400 });
     }
 
-    const filePath = path.join(STORAGE_ROOT, key);
+    let filePath: string;
+    try {
+      filePath = resolveSafeStoragePath(STORAGE_ROOT, key);
+    } catch {
+      return NextResponse.json({ error: "Invalid key" }, { status: 400 });
+    }
+
     if (!fs.existsSync(filePath)) {
       return NextResponse.json({ error: "File not found" }, { status: 404 });
     }
@@ -28,6 +33,9 @@ export async function GET(req: NextRequest) {
         fileStream.on("data", (chunk) => controller.enqueue(chunk));
         fileStream.on("end", () => controller.close());
         fileStream.on("error", (err) => controller.error(err));
+      },
+      cancel() {
+        fileStream.destroy();
       },
     });
 

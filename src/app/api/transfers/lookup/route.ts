@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   normalizeTransferCode,
+  type IntegrityStatus,
   type TransferPublicInfo,
+  type UploadStatus,
 } from "@/lib/types";
 import {
   hashTransferCode,
@@ -108,13 +110,13 @@ export async function POST(req: NextRequest) {
       senderMessage: transfer.senderMessage || undefined,
       allowPreview: transfer.allowPreview,
       allowOriginalDownload: transfer.allowOriginalDownload,
-      integrityStatus: transfer.integrityStatus as any,
+      integrityStatus: transfer.integrityStatus as IntegrityStatus,
       checksumAlgorithm: transfer.checksumAlgorithm || undefined,
       checksumValue: transfer.checksumValue || undefined,
       downloadLimit: transfer.downloadLimit || undefined,
       downloadCount: transfer.downloadCount,
       passwordRequired: !!transfer.passwordHash,
-      uploadStatus: transfer.uploadStatus as any,
+      uploadStatus: transfer.uploadStatus as UploadStatus,
       isP2P,
     };
 

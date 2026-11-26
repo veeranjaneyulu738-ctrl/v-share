@@ -4,13 +4,13 @@ import { deleteObject, cleanupAbandonedUploads } from "@/lib/storage";
 
 export async function POST(req: NextRequest) {
   try {
-    // Optional secret check
+    // Require authorization when CRON_SECRET or TRANSFER_CODE_SECRET is configured
     const authHeader = req.headers.get("authorization");
     const cronSecret = process.env.CRON_SECRET || process.env.TRANSFER_CODE_SECRET;
 
-    if (cronSecret && authHeader) {
-      const token = authHeader.replace(/^Bearer\s+/i, "").trim();
-      if (token !== cronSecret) {
+    if (cronSecret) {
+      const token = authHeader?.replace(/^Bearer\s+/i, "").trim();
+      if (!token || token !== cronSecret) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
       }
     }
@@ -21,7 +21,7 @@ export async function POST(req: NextRequest) {
 
     for (const transfer of expired) {
       try {
-        if (transfer.objectKey) {
+        if (transfer.objectKey && !transfer.objectKey.startsWith("p2p://")) {
           await deleteObject(transfer.objectKey);
         }
         await markTransferExpired(transfer.id);

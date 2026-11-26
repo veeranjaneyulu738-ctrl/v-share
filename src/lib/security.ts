@@ -52,7 +52,7 @@ interface RateLimitEntry {
 const rateLimitStore = new Map<string, RateLimitEntry>();
 
 // Clean up old entries periodically
-setInterval(() => {
+const cleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of rateLimitStore) {
     if (entry.resetAt <= now) {
@@ -60,6 +60,9 @@ setInterval(() => {
     }
   }
 }, 60_000); // Every minute
+if (typeof cleanupTimer.unref === "function") {
+  cleanupTimer.unref();
+}
 
 export function checkRateLimit(
   key: string,

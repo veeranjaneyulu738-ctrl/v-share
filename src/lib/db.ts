@@ -1,21 +1,19 @@
+import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+
 // Prisma Client with dynamic initialization and graceful fallback
-let prismaClientInstance: any = null;
+let prismaClientInstance: PrismaClient | null = null;
 
 try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const prismaPkg = require("@prisma/client");
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { PrismaPg } = require("@prisma/adapter-pg");
-
   const databaseUrl = process.env.DATABASE_URL;
 
-  if (prismaPkg && prismaPkg.PrismaClient && databaseUrl) {
-    const globalForPrisma = globalThis as unknown as { prisma: any };
+  if (databaseUrl) {
+    const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
     if (globalForPrisma.prisma) {
       prismaClientInstance = globalForPrisma.prisma;
     } else {
       const adapter = new PrismaPg({ connectionString: databaseUrl });
-      prismaClientInstance = new prismaPkg.PrismaClient({
+      prismaClientInstance = new PrismaClient({
         adapter,
         log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"],
       });

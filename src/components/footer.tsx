@@ -48,9 +48,9 @@ export function Footer() {
                 </Link>
               </li>
               <li>
-                <a href="#how-it-works" className="text-sm hover:underline" style={{ color: "var(--vl-text-secondary)" }}>
+                <Link href="/#how-it-works" className="text-sm hover:underline" style={{ color: "var(--vl-text-secondary)" }}>
                   How It Works
-                </a>
+                </Link>
               </li>
             </ul>
           </div>
