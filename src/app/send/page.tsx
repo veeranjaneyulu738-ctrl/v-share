@@ -17,6 +17,15 @@ import { P2PSenderSession, type P2PProgress, type P2PStatus } from "@/lib/webrtc
 
 const MAX_BATCH_SIZE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB limit
 
+function getShareOrigin(): string {
+  if (typeof window === "undefined") return process.env.NEXT_PUBLIC_APP_URL || "";
+  const { hostname, origin } = window.location;
+  if (hostname.endsWith(".vercel.app") && process.env.NEXT_PUBLIC_APP_URL) {
+    return process.env.NEXT_PUBLIC_APP_URL;
+  }
+  return origin;
+}
+
 // ===== Types =====
 type SendStep = "select" | "settings" | "uploading" | "complete";
 
@@ -111,7 +120,7 @@ export default function SendPage() {
   // Generate QR Code on completion
   useEffect(() => {
     if (result?.code) {
-      const receiveUrl = `${window.location.origin}/receive?code=${encodeURIComponent(result.code)}`;
+      const receiveUrl = `${getShareOrigin()}/receive?code=${encodeURIComponent(result.code)}`;
       QRCode.toDataURL(receiveUrl, {
         width: 256,
         margin: 2,
@@ -299,8 +308,8 @@ export default function SendPage() {
           downloadLimit,
         });
 
-        const appUrl = window.location.origin;
-        const watchUrl = `${appUrl}/receive?code=${code}`;
+        const appUrl = getShareOrigin();
+        const watchUrl = `${appUrl}/receive?code=${encodeURIComponent(code)}`;
         QRCode.toDataURL(watchUrl, {
           width: 220,
           margin: 2,
@@ -532,7 +541,7 @@ export default function SendPage() {
 
   const shareTransfer = useCallback(async () => {
     if (!result) return;
-    const shareUrl = `${window.location.origin}/receive?code=${encodeURIComponent(result.code)}`;
+    const shareUrl = `${getShareOrigin()}/receive?code=${encodeURIComponent(result.code)}`;
     const shareData = {
       title: "VIDELINK Transfer",
       text: `I've shared a video with you. Use code: ${result.code}`,
