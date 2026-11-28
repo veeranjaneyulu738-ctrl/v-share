@@ -164,7 +164,7 @@ function ReceivePageContent() {
   }, [password, lookupTransfer]);
 
   // ===== Download Original =====
-  const downloadOriginal = useCallback(async () => {
+  const downloadOriginal = useCallback(async (isRetry = false) => {
     if (!transfer) return;
 
     if (transfer.isP2P) {
@@ -172,6 +172,8 @@ function ReceivePageContent() {
         alert("Transfer session ID is missing.");
         return;
       }
+      p2pReceiverRef.current?.destroy();
+      setP2pComplete(false);
       setP2pStatus("initializing");
       setP2pStatusMsg("Connecting directly to sender's browser...");
 
@@ -203,7 +205,7 @@ function ReceivePageContent() {
         setP2pComplete(true);
       };
 
-      p2p.start();
+      p2p.start(isRetry);
       return;
     }
 
@@ -527,12 +529,16 @@ function ReceivePageContent() {
                         background:
                           p2pComplete
                             ? "rgba(16, 185, 129, 0.08)"
+                            : p2pStatus === "failed"
+                            ? "rgba(239, 68, 68, 0.08)"
                             : p2pStatus === "streaming"
                             ? "rgba(99, 102, 241, 0.08)"
                             : "var(--vl-bg-secondary)",
                         borderColor:
                           p2pComplete
                             ? "var(--vl-success)"
+                            : p2pStatus === "failed"
+                            ? "var(--vl-error)"
                             : p2pStatus === "streaming"
                             ? "var(--vl-accent)"
                             : "var(--vl-border-default)",
@@ -541,19 +547,23 @@ function ReceivePageContent() {
                       <div className="flex items-center justify-between mb-2">
                         <div className="flex items-center gap-2.5">
                           <span className="relative flex h-3 w-3">
-                            <span
-                              className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                                p2pComplete
-                                  ? "bg-emerald-400"
-                                  : p2pStatus === "streaming"
-                                  ? "bg-indigo-400"
-                                  : "bg-amber-400"
-                              }`}
-                            />
+                            {p2pStatus !== "failed" && (
+                              <span
+                                className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
+                                  p2pComplete
+                                    ? "bg-emerald-400"
+                                    : p2pStatus === "streaming"
+                                    ? "bg-indigo-400"
+                                    : "bg-amber-400"
+                                }`}
+                              />
+                            )}
                             <span
                               className={`relative inline-flex rounded-full h-3 w-3 ${
                                 p2pComplete
                                   ? "bg-emerald-500"
+                                  : p2pStatus === "failed"
+                                  ? "bg-red-500"
                                   : p2pStatus === "streaming"
                                   ? "bg-indigo-500"
                                   : "bg-amber-500"
@@ -701,9 +711,9 @@ function ReceivePageContent() {
 
                 {transfer.allowOriginalDownload && (
                   <button
-                    onClick={downloadOriginal}
+                    onClick={() => downloadOriginal(p2pStatus === "failed")}
                     className="vl-btn-primary flex-1 py-3.5"
-                    disabled={downloading || p2pStatus === "streaming" || p2pStatus === "initializing" || p2pComplete}
+                    disabled={downloading || p2pStatus === "streaming" || p2pStatus === "initializing" || p2pStatus === "connecting" || p2pComplete}
                   >
                     {p2pStatus === "streaming" ? (
                       <>
@@ -738,7 +748,7 @@ function ReceivePageContent() {
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                           <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
                         </svg>
-                        Start Direct P2P Download
+                        {p2pStatus === "failed" ? "Retry P2P Connection" : "Start Direct P2P Download"}
                       </>
                     ) : (
                       <>

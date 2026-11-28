@@ -10,19 +10,43 @@ import {
   ListMultipartUploadsCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import {
+  del as blobDel,
+  getDownloadUrl as blobGetDownloadUrl,
+  head as blobHead,
+  issueSignedToken as blobIssueSignedToken,
+  presignUrl as blobPresignUrl,
+} from "@vercel/blob";
 import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
 
+export type StorageMode = "blob" | "r2" | "mock";
+
 // ===== Storage Mode Detection =====
-export function isMockMode(): boolean {
-  if (process.env.STORAGE_MODE === "mock") return true;
-  const accountId = process.env.R2_ACCOUNT_ID;
-  if (!accountId || accountId.startsWith("demo-") || accountId === "your-cloudflare-account-id") {
-    return true;
+export function getStorageMode(): StorageMode {
+  if (process.env.STORAGE_MODE === "mock") return "mock";
+  if (
+    process.env.STORAGE_MODE === "blob" ||
+    Boolean(process.env.BLOB_READ_WRITE_TOKEN) ||
+    Boolean(process.env.BLOB_STORE_ID)
+  ) {
+    return "blob";
   }
-  return false;
+  const accountId = process.env.R2_ACCOUNT_ID;
+  if (
+    accountId &&
+    !accountId.startsWith("demo-") &&
+    accountId !== "your-cloudflare-account-id"
+  ) {
+    return "r2";
+  }
+  return "mock";
+}
+
+export function isMockMode(): boolean {
+  return getStorageMode() === "mock";
 }
 
 const DATA_ROOT = process.env.VERCEL
@@ -111,7 +135,11 @@ export async function createMultipartUpload(
   objectKey: string,
   contentType: string
 ): Promise<string> {
-  if (isMockMode()) {
+  const mode = getStorageMode();
+  if (mode === "blob") {
+    return `blob_${Date.now()}_${crypto.randomBytes(6).toString("hex")}`;
+  }
+  if (mode === "mock") {
     const uploadId = `mock_up_${Date.now()}_${crypto.randomBytes(6).toString("hex")}`;
     const uploadDir = resolveSafeStoragePath(CHUNKS_ROOT, uploadId);
     ensureDir(uploadDir);
@@ -136,7 +164,11 @@ export async function getPresignedUploadUrl(
   partNumber: number,
   appOrigin?: string
 ): Promise<string> {
-  if (isMockMode()) {
+  const mode = getStorageMode();
+  if (mode === "blob") {
+    return `${getAppUrl(appOrigin)}/api/blob/upload`;
+  }
+  if (mode === "mock") {
     return `${getAppUrl(appOrigin)}/api/mock-storage/upload?uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}&key=${encodeURIComponent(objectKey)}`;
   }
 
@@ -155,7 +187,12 @@ export async function completeMultipartUpload(
   uploadId: string,
   parts: { partNumber: number; etag: string }[]
 ): Promise<void> {
-  if (isMockMode()) {
+  const mode = getStorageMode();
+  if (mode === "blob") {
+    // Client-side @vercel/blob/client upload already finalized the blob object
+    return;
+  }
+  if (mode === "mock") {
     const uploadDir = resolveSafeStoragePath(CHUNKS_ROOT, uploadId);
     const targetFilePath = resolveSafeStoragePath(STORAGE_ROOT, objectKey);
     ensureDir(path.dirname(targetFilePath));
@@ -215,7 +252,14 @@ export async function abortMultipartUpload(
   objectKey: string,
   uploadId: string
 ): Promise<void> {
-  if (isMockMode()) {
+  const mode = getStorageMode();
+  if (mode === "blob") {
+    try {
+      await blobDel(objectKey);
+    } catch {}
+    return;
+  }
+  if (mode === "mock") {
     try {
       const uploadDir = resolveSafeStoragePath(CHUNKS_ROOT, uploadId);
       if (fs.existsSync(uploadDir)) {
@@ -238,6 +282,22 @@ export async function abortMultipartUpload(
   }
 }
 
+async function getBlobPresignedGetUrl(objectKey: string, expiresIn: number): Promise<string> {
+  const validUntil = Date.now() + expiresIn * 1000;
+  const signedToken = await blobIssueSignedToken({
+    pathname: objectKey,
+    operations: ["get"],
+    validUntil,
+  });
+  const { presignedUrl } = await blobPresignUrl(signedToken, {
+    operation: "get",
+    pathname: objectKey,
+    access: "private",
+    validUntil,
+  });
+  return presignedUrl;
+}
+
 // ===== Presigned Download URL =====
 export async function getPresignedDownloadUrl(
   objectKey: string,
@@ -245,7 +305,12 @@ export async function getPresignedDownloadUrl(
   expiresIn: number = 300,
   appOrigin?: string
 ): Promise<string> {
-  if (isMockMode()) {
+  const mode = getStorageMode();
+  if (mode === "blob") {
+    const presignedUrl = await getBlobPresignedGetUrl(objectKey, expiresIn);
+    return blobGetDownloadUrl(presignedUrl);
+  }
+  if (mode === "mock") {
     return `${getAppUrl(appOrigin)}/api/mock-storage/download?key=${encodeURIComponent(objectKey)}&filename=${encodeURIComponent(filename)}`;
   }
 
@@ -265,7 +330,11 @@ export async function getPresignedPreviewUrl(
   expiresIn: number = 300,
   appOrigin?: string
 ): Promise<string> {
-  if (isMockMode()) {
+  const mode = getStorageMode();
+  if (mode === "blob") {
+    return getBlobPresignedGetUrl(objectKey, expiresIn);
+  }
+  if (mode === "mock") {
     return `${getAppUrl(appOrigin)}/api/mock-storage/preview?key=${encodeURIComponent(objectKey)}`;
   }
 
@@ -285,7 +354,16 @@ export async function headObject(objectKey: string): Promise<{
   contentType: string;
   etag: string;
 }> {
-  if (isMockMode()) {
+  const mode = getStorageMode();
+  if (mode === "blob") {
+    const meta = await blobHead(objectKey);
+    return {
+      contentLength: meta.size,
+      contentType: meta.contentType || "video/mp4",
+      etag: meta.etag || "",
+    };
+  }
+  if (mode === "mock") {
     const filePath = resolveSafeStoragePath(STORAGE_ROOT, objectKey);
     if (!fs.existsSync(filePath)) {
       throw new Error(`Object not found: ${objectKey}`);
@@ -313,7 +391,16 @@ export async function headObject(objectKey: string): Promise<{
 
 // ===== Delete Object =====
 export async function deleteObject(objectKey: string): Promise<void> {
-  if (isMockMode()) {
+  const mode = getStorageMode();
+  if (mode === "blob") {
+    try {
+      await blobDel(objectKey);
+    } catch (error) {
+      console.warn("Blob delete warning:", error);
+    }
+    return;
+  }
+  if (mode === "mock") {
     try {
       const filePath = resolveSafeStoragePath(STORAGE_ROOT, objectKey);
       if (fs.existsSync(filePath)) {
@@ -338,7 +425,11 @@ export async function deleteObject(objectKey: string): Promise<void> {
 
 // ===== Cleanup Abandoned Uploads =====
 export async function cleanupAbandonedUploads(): Promise<number> {
-  if (isMockMode()) {
+  const mode = getStorageMode();
+  if (mode === "blob") {
+    return 0;
+  }
+  if (mode === "mock") {
     let cleaned = 0;
     try {
       if (fs.existsSync(CHUNKS_ROOT)) {

@@ -6,7 +6,7 @@ import {
   updateUploadSession,
   createTransferEvent,
 } from "@/lib/dal";
-import { completeMultipartUpload, headObject, isMockMode } from "@/lib/storage";
+import { completeMultipartUpload, getStorageMode, headObject } from "@/lib/storage";
 
 export async function POST(
   req: NextRequest,
@@ -15,13 +15,14 @@ export async function POST(
   try {
     const { id: transferId } = await params;
     const body = await req.json();
-    const { sessionId, parts, checksumValue } = body as {
+    const { sessionId, parts = [], checksumValue } = body as {
       sessionId: string;
-      parts: { partNumber: number; etag: string }[];
+      parts?: { partNumber: number; etag: string }[];
       checksumValue?: string;
     };
 
-    if (!sessionId || !Array.isArray(parts) || parts.length === 0) {
+    const storageMode = getStorageMode();
+    if (!sessionId || (storageMode !== "blob" && (!Array.isArray(parts) || parts.length === 0))) {
       return NextResponse.json({ error: "Invalid finalize payload" }, { status: 400 });
     }
 
@@ -47,8 +48,8 @@ export async function POST(
       }
     } catch (e) {
       console.warn("Head object verification warning:", e);
-      // In mock mode, object should be readable immediately; only allow eventual consistency on remote S3/R2
-      verified = !isMockMode();
+      // Mock and Vercel Blob are immediately consistent; only remote S3/R2 may have eventual head consistency
+      verified = storageMode === "r2";
     }
 
     const integrityStatus = verified ? "verified" : "pending";

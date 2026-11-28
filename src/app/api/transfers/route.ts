@@ -13,6 +13,7 @@ import {
 import {
   createMultipartUpload,
   generateObjectKey,
+  getStorageMode,
 } from "@/lib/storage";
 import {
   createTransfer,
@@ -142,6 +143,7 @@ export async function POST(req: NextRequest) {
       {
         transferId: transfer.id,
         code: displayCode,
+        storageProvider: getStorageMode(),
         session: {
           sessionId: session.id,
           transferId: transfer.id,

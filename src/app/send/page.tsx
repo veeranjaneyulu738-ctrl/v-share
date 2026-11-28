@@ -13,6 +13,7 @@ import {
   type CreateTransferInput,
 } from "@/lib/types";
 import QRCode from "qrcode";
+import { upload as uploadToVercelBlob } from "@vercel/blob/client";
 import { P2PSenderSession, type P2PProgress, type P2PStatus } from "@/lib/webrtc";
 
 const MAX_BATCH_SIZE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB limit
@@ -64,8 +65,8 @@ export default function SendPage() {
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Settings state
-  const [transferMode, setTransferMode] = useState<"p2p" | "cloud">("p2p");
+  // Settings state — Cloud Storage works across any network (Wi-Fi, 5G, mobile)
+  const [transferMode, setTransferMode] = useState<"p2p" | "cloud">("cloud");
   const [p2pStatus, setP2pStatus] = useState<P2PStatus>("waiting_for_peer");
   const [p2pStatusMsg, setP2pStatusMsg] = useState("Waiting for recipient to enter code...");
   const [p2pProgress, setP2pProgress] = useState<P2PProgress>({
@@ -96,6 +97,7 @@ export default function SendPage() {
     status: "uploading",
   });
   const uploadAbortRef = useRef(false);
+  const blobAbortControllerRef = useRef<AbortController | null>(null);
 
   // Result state
   const [result, setResult] = useState<TransferResult | null>(null);
@@ -195,7 +197,11 @@ export default function SendPage() {
         setSelectedFiles((prev) => {
           const existingKeys = new Set(prev.map((f) => `${f.name}_${f.size}`));
           const filteredNew = validFiles.filter((f) => !existingKeys.has(`${f.name}_${f.size}`));
-          return [...prev, ...filteredNew];
+          const next = [...prev, ...filteredNew];
+          if (next.length > 1) {
+            setTransferMode("p2p");
+          }
+          return next;
         });
         setStep("settings");
       }
@@ -235,9 +241,10 @@ export default function SendPage() {
   );
 
   // ===== Upload Logic =====
-  const startUpload = useCallback(async () => {
+  const startUpload = useCallback(async (overrideMode?: "p2p" | "cloud") => {
+    const activeMode = overrideMode ?? transferMode;
     if (selectedFiles.length === 0 || !selectedFile) return;
-    if (transferMode === "cloud" && selectedFiles.length > 1) {
+    if (activeMode === "cloud" && selectedFiles.length > 1) {
       alert("Cloud Storage mode supports 1 video at a time. Remove extra videos or switch to Direct P2P Stream for multiple videos.");
       return;
     }
@@ -245,11 +252,11 @@ export default function SendPage() {
     uploadAbortRef.current = false;
 
     const totalBatchBytes =
-      transferMode === "cloud"
+      activeMode === "cloud"
         ? selectedFile.size
         : selectedFiles.reduce((acc, f) => acc + f.size, 0);
     const displayTitle =
-      transferMode === "cloud" || selectedFiles.length === 1
+      activeMode === "cloud" || selectedFiles.length === 1
         ? selectedFile.name
         : `${selectedFiles[0].name} (+${selectedFiles.length - 1} videos)`;
 
@@ -274,8 +281,8 @@ export default function SendPage() {
         allowPreview,
         allowOriginalDownload: true,
         checksumAlgorithm: "SHA-256",
-        isP2P: transferMode === "p2p",
-        transferMode,
+        isP2P: activeMode === "p2p",
+        transferMode: activeMode,
         ...(password ? { password } : {}),
         ...(downloadLimit ? { downloadLimit } : {}),
         ...(senderMessage ? { senderMessage } : {}),
@@ -293,7 +300,7 @@ export default function SendPage() {
       }
 
       const resData = await createRes.json();
-      const { transferId, code, session, isP2P } = resData;
+      const { transferId, code, session, isP2P, storageProvider } = resData;
 
       if (isP2P) {
         // P2P Direct Streaming mode with Multi-File support
@@ -347,116 +354,157 @@ export default function SendPage() {
         );
       } catch {}
 
-      // Step 2: Upload parts with bounded concurrency
       const partETags: { partNumber: number; etag: string }[] = [];
-      let uploadedBytes = 0;
-      const startTime = Date.now();
 
-      // Get presigned URLs for all parts
-      const urlRes = await fetch(`/api/transfers/${transferId}/upload-urls`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId: session.sessionId,
-          partNumbers: Array.from({ length: totalParts }, (_, i) => i + 1),
-        }),
-      });
+      if (storageProvider === "blob") {
+        // Direct-to-Vercel-Blob upload (supports large files without serverless body limit)
+        const controller = new AbortController();
+        blobAbortControllerRef.current = controller;
+        const uploadStart = Date.now();
 
-      if (!urlRes.ok) {
-        throw new Error("Failed to get upload URLs");
-      }
+        try {
+          await uploadToVercelBlob(session.objectKey, selectedFile, {
+            access: "private",
+            handleUploadUrl: "/api/blob/upload",
+            multipart: selectedFile.size > 4 * 1024 * 1024,
+            contentType: selectedFile.type || "video/mp4",
+            clientPayload: JSON.stringify({
+              transferId,
+              sessionId: session.sessionId,
+            }),
+            abortSignal: controller.signal,
+            onUploadProgress: (ev) => {
+              const elapsed = Math.max((Date.now() - uploadStart) / 1000, 0.1);
+              const speed = ev.loaded / elapsed;
+              const remaining = speed > 0 ? Math.max(0, (selectedFile.size - ev.loaded) / speed) : 0;
+              setProgress({
+                totalBytes: selectedFile.size,
+                uploadedBytes: ev.loaded,
+                percentage: Math.min(99, Math.round(ev.percentage)),
+                speed,
+                eta: remaining,
+                partsCompleted: Math.max(1, Math.round((ev.percentage / 100) * totalParts)),
+                totalParts,
+                status: "uploading",
+              });
+            },
+          });
+        } catch (err) {
+          if (uploadAbortRef.current || (err instanceof Error && err.name === "AbortError")) {
+            setProgress((p) => ({ ...p, status: "error", errorMessage: "Upload cancelled" }));
+            return;
+          }
+          throw err;
+        } finally {
+          blobAbortControllerRef.current = null;
+        }
+      } else {
+        // Step 2: Upload parts with bounded concurrency (R2 or local mock)
+        let uploadedBytes = 0;
+        const startTime = Date.now();
 
-      const { urls } = await urlRes.json();
+        const urlRes = await fetch(`/api/transfers/${transferId}/upload-urls`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sessionId: session.sessionId,
+            partNumbers: Array.from({ length: totalParts }, (_, i) => i + 1),
+          }),
+        });
 
-      // Upload parts with concurrency control
-      const queue = [...urls] as { partNumber: number; url: string }[];
-      const inFlight = new Set<Promise<void>>();
+        if (!urlRes.ok) {
+          throw new Error("Failed to get upload URLs");
+        }
 
-      const uploadPart = async (part: { partNumber: number; url: string }) => {
-        if (uploadAbortRef.current) return;
+        const { urls } = await urlRes.json();
 
-        const start = (part.partNumber - 1) * UPLOAD_PART_SIZE;
-        const end = Math.min(start + UPLOAD_PART_SIZE, selectedFile.size);
-        const chunk = selectedFile.slice(start, end);
+        const queue = [...urls] as { partNumber: number; url: string }[];
+        const inFlight = new Set<Promise<void>>();
 
-        // Retry with exponential backoff
-        let attempt = 0;
-        const maxRetries = 3;
+        const uploadPart = async (part: { partNumber: number; url: string }) => {
+          if (uploadAbortRef.current) return;
 
-        while (attempt <= maxRetries) {
-          try {
-            const res = await fetch(part.url, {
-              method: "PUT",
-              body: chunk,
-              headers: { "Content-Type": "application/octet-stream" },
-            });
+          const start = (part.partNumber - 1) * UPLOAD_PART_SIZE;
+          const end = Math.min(start + UPLOAD_PART_SIZE, selectedFile.size);
+          const chunk = selectedFile.slice(start, end);
 
-            if (!res.ok) throw new Error(`Part ${part.partNumber} upload failed: ${res.status}`);
+          let attempt = 0;
+          const maxRetries = 3;
 
-            const etag = res.headers.get("etag") || `"part-${part.partNumber}"`;
-            partETags.push({ partNumber: part.partNumber, etag });
-            uploadedBytes += end - start;
+          while (attempt <= maxRetries) {
+            try {
+              const res = await fetch(part.url, {
+                method: "PUT",
+                body: chunk,
+                headers: { "Content-Type": "application/octet-stream" },
+              });
 
-            const elapsed = (Date.now() - startTime) / 1000;
-            const speed = uploadedBytes / elapsed;
-            const remaining = (selectedFile.size - uploadedBytes) / speed;
+              if (!res.ok) throw new Error(`Part ${part.partNumber} upload failed: ${res.status}`);
 
-            setProgress({
-              totalBytes: selectedFile.size,
-              uploadedBytes,
-              percentage: Math.round((uploadedBytes / selectedFile.size) * 100),
-              speed,
-              eta: remaining,
-              partsCompleted: partETags.length,
-              totalParts,
-              status: "uploading",
-            });
+              const etag = res.headers.get("etag") || `"part-${part.partNumber}"`;
+              partETags.push({ partNumber: part.partNumber, etag });
+              uploadedBytes += end - start;
 
-            return; // Success
-          } catch (err) {
-            attempt++;
-            if (attempt > maxRetries) throw err;
-            // Exponential backoff with jitter
-            const delay = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 10000);
-            await new Promise((r) => setTimeout(r, delay));
+              const elapsed = Math.max((Date.now() - startTime) / 1000, 0.1);
+              const speed = uploadedBytes / elapsed;
+              const remaining = (selectedFile.size - uploadedBytes) / speed;
+
+              setProgress({
+                totalBytes: selectedFile.size,
+                uploadedBytes,
+                percentage: Math.round((uploadedBytes / selectedFile.size) * 100),
+                speed,
+                eta: remaining,
+                partsCompleted: partETags.length,
+                totalParts,
+                status: "uploading",
+              });
+
+              return;
+            } catch (err) {
+              attempt++;
+              if (attempt > maxRetries) throw err;
+              const delay = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 10000);
+              await new Promise((r) => setTimeout(r, delay));
+            }
+          }
+        };
+
+        for (const part of queue) {
+          if (uploadAbortRef.current) break;
+
+          const promise = uploadPart(part).then(() => {
+            inFlight.delete(promise);
+          });
+          inFlight.add(promise);
+
+          if (inFlight.size >= MAX_CONCURRENT_UPLOADS) {
+            await Promise.race(inFlight);
           }
         }
-      };
+        await Promise.all(inFlight);
 
-      // Process queue with bounded concurrency
-      for (const part of queue) {
-        if (uploadAbortRef.current) break;
-
-        const promise = uploadPart(part).then(() => {
-          inFlight.delete(promise);
-        });
-        inFlight.add(promise);
-
-        if (inFlight.size >= MAX_CONCURRENT_UPLOADS) {
-          await Promise.race(inFlight);
+        if (uploadAbortRef.current) {
+          setProgress((p) => ({ ...p, status: "error", errorMessage: "Upload cancelled" }));
+          return;
         }
-      }
-      await Promise.all(inFlight);
-
-      if (uploadAbortRef.current) {
-        setProgress((p) => ({ ...p, status: "error", errorMessage: "Upload cancelled" }));
-        return;
       }
 
       // Step 3: Finalize the upload
       setProgress((p) => ({ ...p, status: "finalizing", percentage: 99 }));
 
-      // Compute SHA-256 checksum
+      // Compute SHA-256 checksum (limit to 256 MB in browser so mobile RAM isn't exhausted)
       let checksumValue: string | undefined;
-      try {
-        const arrayBuffer = await selectedFile.arrayBuffer();
-        const hashBuffer = await crypto.subtle.digest("SHA-256", arrayBuffer);
-        checksumValue = Array.from(new Uint8Array(hashBuffer))
-          .map((b) => b.toString(16).padStart(2, "0"))
-          .join("");
-      } catch {
-        // If Web Crypto API not available, skip client-side checksum
-        console.warn("Client-side checksum computation not available");
+      if (selectedFile.size <= 256 * 1024 * 1024) {
+        try {
+          const arrayBuffer = await selectedFile.arrayBuffer();
+          const hashBuffer = await crypto.subtle.digest("SHA-256", arrayBuffer);
+          checksumValue = Array.from(new Uint8Array(hashBuffer))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join("");
+        } catch {
+          console.warn("Client-side checksum computation not available");
+        }
       }
 
       const finalizeRes = await fetch(`/api/transfers/${transferId}/finalize`, {
@@ -503,6 +551,7 @@ export default function SendPage() {
 
   const cancelUpload = useCallback(() => {
     uploadAbortRef.current = true;
+    blobAbortControllerRef.current?.abort();
   }, []);
 
   const copyTextToClipboard = useCallback(async (text: string): Promise<boolean> => {
@@ -753,6 +802,29 @@ export default function SendPage() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <button
                   type="button"
+                  disabled={selectedFiles.length > 1}
+                  onClick={() => setTransferMode("cloud")}
+                  className="p-4 rounded-xl text-left transition-all flex flex-col justify-between disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{
+                    background: transferMode === "cloud" ? "rgba(99, 102, 241, 0.12)" : "var(--vl-bg-secondary)",
+                    border: `1.5px solid ${transferMode === "cloud" ? "var(--vl-accent)" : "var(--vl-border-default)"}`,
+                  }}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-semibold text-sm flex items-center gap-1.5" style={{ color: "var(--vl-accent)" }}>
+                      ☁️ Cloud Storage
+                    </span>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-400">
+                      RECOMMENDED · ANY NETWORK
+                    </span>
+                  </div>
+                  <p className="text-xs" style={{ color: "var(--vl-text-secondary)" }}>
+                    Uploaded securely to private cloud storage. Works reliably across mobile 4G/5G and Wi-Fi even when you go offline.
+                  </p>
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => setTransferMode("p2p")}
                   className="p-4 rounded-xl text-left transition-all flex flex-col justify-between"
                   style={{
@@ -765,36 +837,19 @@ export default function SendPage() {
                       ⚡ Direct P2P Stream
                     </span>
                     <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
-                      UNLIMITED GB
+                      SAME WI-FI / 5GB+
                     </span>
                   </div>
                   <p className="text-xs" style={{ color: "var(--vl-text-secondary)" }}>
-                    Zero cloud storage required. Direct browser-to-browser encrypted streaming. Ideal for 5GB+ files.
-                  </p>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setTransferMode("cloud")}
-                  className="p-4 rounded-xl text-left transition-all flex flex-col justify-between"
-                  style={{
-                    background: transferMode === "cloud" ? "rgba(99, 102, 241, 0.12)" : "var(--vl-bg-secondary)",
-                    border: `1.5px solid ${transferMode === "cloud" ? "var(--vl-accent)" : "var(--vl-border-default)"}`,
-                  }}
-                >
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="font-semibold text-sm flex items-center gap-1.5" style={{ color: "var(--vl-accent)" }}>
-                      ☁️ Cloud Storage
-                    </span>
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-400">
-                      ASYNC
-                    </span>
-                  </div>
-                  <p className="text-xs" style={{ color: "var(--vl-text-secondary)" }}>
-                    File is uploaded to cloud storage. Recipient can download anytime even when you are offline.
+                    Direct browser-to-browser encrypted streaming. Both devices must stay open; strict mobile CGNAT may block direct peers.
                   </p>
                 </button>
               </div>
+              {selectedFiles.length > 1 && (
+                <p className="text-xs mt-2.5" style={{ color: "var(--vl-text-secondary)" }}>
+                  Cloud mode supports 1 video; multi-file uses P2P.
+                </p>
+              )}
             </div>
 
             {/* Expiration */}
@@ -928,7 +983,7 @@ export default function SendPage() {
             </div>
 
             {/* Upload Button */}
-            <button onClick={startUpload} className="vl-btn-primary w-full py-4 text-base">
+            <button onClick={() => startUpload()} className="vl-btn-primary w-full py-4 text-base">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
                 <polyline points="17 8 12 3 7 8" />
@@ -1049,9 +1104,9 @@ export default function SendPage() {
                     Cancel Upload
                   </button>
                 )}
-                {progress.status === "error" && (
+                  {progress.status === "error" && (
                   <>
-                    <button onClick={startUpload} className="vl-btn-primary text-sm">
+                    <button onClick={() => startUpload()} className="vl-btn-primary text-sm">
                       Retry Upload
                     </button>
                     <button
@@ -1341,6 +1396,25 @@ export default function SendPage() {
                       {p2pStatus === "completed" && (
                         <div className="mt-3 pt-3 border-t border-[var(--vl-border-subtle)] flex items-center gap-2 text-xs" style={{ color: "var(--vl-success)" }}>
                           <span>🎉 Transfer completed successfully! All files delivered.</span>
+                        </div>
+                      )}
+
+                      {p2pStatus === "failed" && selectedFiles.length === 1 && (
+                        <div className="mt-3 pt-3 border-t border-[var(--vl-border-subtle)] flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                          <span className="text-[11px]" style={{ color: "var(--vl-error)" }}>
+                            Mobile/Wi-Fi NAT blocked direct P2P. Upload to Cloud Storage so it works on any network.
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              p2pSessionRef.current?.destroy();
+                              setTransferMode("cloud");
+                              startUpload("cloud");
+                            }}
+                            className="vl-btn-primary text-xs py-2 px-3 flex-shrink-0"
+                          >
+                            ☁️ Upload to Cloud Instead
+                          </button>
                         </div>
                       )}
                     </div>
